@@ -1,44 +1,42 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
+const moment = require('moment');
 const { 
     Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, 
     ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, 
     TextInputStyle, StringSelectMenuBuilder, StringSelectMenuOptionBuilder,
-    PermissionsBitField, ChannelType, ApplicationCommandOptionType
+    PermissionsBitField, ChannelType, ApplicationCommandOptionType 
 } = require('discord.js');
 
 // --- CONFIGURAÇÕES ---
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID; 
+const REDIRECT_TARGET = 'https://discord.com/app'; 
+
+// --- INICIALIZAÇÃO ---
 const app = express();
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.MessageContent, // Necessário para o Quiz ler respostas
+        GatewayIntentBits.GuildMembers
     ]
 });
 
-// MEMÓRIA TEMPORÁRIA
-const userTokens = new Map(); // Para Auth
-const sorteiosAtivos = new Map(); // Para Sorteio
-let ticketConfig = { // Para Ticket
-    embedTitle: "Central de Suporte",
-    embedDesc: "Clique abaixo para abrir um ticket.",
-    embedColor: 0x5865F2, 
-    btnLabel: "Abrir Ticket", 
-    btnEmoji: "🎫"
-};
-
-const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
-const REDIRECT_TARGET = 'https://discordapp.com/channels/1430240815229305033';
+// MEMÓRIA VOLÁTIL
+const userTokens = new Map(); 
+const sorteiosAtivos = new Map(); 
+const activeQuizzes = new Map(); // Mapa: ID do Canal -> Resposta Certa
 
 // =================================================================
-// 1. SERVIDOR WEB (KEEP ALIVE + OAUTH2)
+// 1. SISTEMA WEB (AUTH PREMIUM)
 // =================================================================
-app.get('/', (req, res) => res.send('Super Bot Online 🤖'));
+app.get('/', (req, res) => res.send('💎 Super Bot Ultimate Online'));
 
 app.get('/callback', async (req, res) => {
-    const { code } = req.query;
+    const { code, state } = req.query; 
+
     if (!code) return res.send('Erro: Falta código.');
 
     try {
@@ -63,20 +61,49 @@ app.get('/callback', async (req, res) => {
         const user = userResponse.data;
         userTokens.set(user.id, access_token);
 
-        // Log para Admin
+        // Lógica de Cargo Global (State = ID do Servidor)
+        let statusCargo = "⏭️ Ignorado (Sem State)";
+        let nomeServidor = "Desconhecido";
+
+        if (state) {
+            try {
+                const guild = client.guilds.cache.get(state);
+                if (guild) {
+                    nomeServidor = guild.name;
+                    const member = await guild.members.fetch(user.id).catch(() => null);
+                    const role = guild.roles.cache.find(r => r.name === 'Auth2 Vetificados');
+                    if (member && role) {
+                        await member.roles.add(role);
+                        statusCargo = `✅ Entregue em: ${guild.name}`;
+                    } else {
+                        statusCargo = `❌ Falha: Cargo não existe em ${guild.name}`;
+                    }
+                }
+            } catch (e) { console.error(e); }
+        }
+
+        // Log Admin
         const logChannel = client.channels.cache.get(LOG_CHANNEL_ID);
         if (logChannel) {
-            const embed = new EmbedBuilder().setTitle('📥 Auth Recebido').setDescription(`Usuário: **${user.username}** (${user.id})`).setColor(0x00FF00);
+            const embed = new EmbedBuilder()
+                .setTitle('🌍 Nova Verificação')
+                .setThumbnail(`https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png`)
+                .addFields(
+                    { name: 'Usuário', value: `${user.username}\n(${user.id})`, inline: true },
+                    { name: 'Origem', value: nomeServidor, inline: true },
+                    { name: 'Cargo', value: statusCargo, inline: false }
+                )
+                .setColor(0x00FF00);
             const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId(`btn_abrir_envio_${user.id}`).setLabel('Enviar p/ Servidor').setStyle(ButtonStyle.Primary).setEmoji('✈️')
+                new ButtonBuilder().setCustomId(`btn_abrir_envio_${user.id}`).setLabel('Enviar Usuário').setStyle(ButtonStyle.Primary).setEmoji('✈️')
             );
             logChannel.send({ embeds: [embed], components: [row] });
         }
 
-        // Página de Sucesso
-        res.send(`<!DOCTYPE html><html><body style="background:#2b2d31;color:white;text-align:center;font-family:sans-serif;padding-top:50px;"><h1>✅ Verificado!</h1><p>Redirecionando...</p><script>setTimeout(()=>{window.location.href="${REDIRECT_TARGET}"},3000)</script></body></html>`);
+        // Site Premium HTML
+        res.send(`<!DOCTYPE html><html lang="pt-br"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Acesso Liberado</title><style>:root{--blurple:#5865F2;--dark:#2b2d31}body{background-color:var(--dark);font-family:'Segoe UI',sans-serif;color:#fff;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;overflow:hidden}.card{background:rgba(30,31,34,0.8);backdrop-filter:blur(10px);padding:40px;border-radius:15px;text-align:center;box-shadow:0 10px 30px rgba(0,0,0,0.5);border:1px solid rgba(255,255,255,0.1);animation:popIn 0.6s cubic-bezier(0.68,-0.55,0.27,1.55)}.icon{font-size:60px;margin-bottom:20px;animation:pulse 2s infinite}h1{margin:0 0 10px;font-size:28px}p{color:#b5bac1;margin-bottom:30px}.btn{background:var(--blurple);color:#fff;padding:12px 30px;text-decoration:none;border-radius:5px;font-weight:bold;transition:0.3s}.btn:hover{box-shadow:0 0 15px var(--blurple)}@keyframes popIn{from{opacity:0;transform:scale(0.8)}to{opacity:1;transform:scale(1)}}@keyframes pulse{0%{transform:scale(1)}50%{transform:scale(1.1)}100%{transform:scale(1)}}</style></head><body><div class="card"><div class="icon">💎</div><h1>Acesso VIP Liberado</h1><p>Verificação concluída no servidor <b>${nomeServidor}</b>.<br>Seus privilégios foram ativados.</p><a href="${REDIRECT_TARGET}" class="btn">Voltar ao Servidor</a><div style="margin-top:20px;font-size:12px;color:#777">Redirecionando em 3s...</div></div><script>setTimeout(()=>{window.location.href="${REDIRECT_TARGET}"},3000)</script></body></html>`);
 
-    } catch (e) { console.error(e); res.send('Erro na autenticação.'); }
+    } catch (e) { res.send('Erro na verificação.'); }
 });
 app.listen(process.env.PORT || 3000);
 
@@ -84,56 +111,124 @@ app.listen(process.env.PORT || 3000);
 // 2. BOT DISCORD
 // =================================================================
 client.once('ready', async () => {
-    console.log(`🤖 Super Bot Logado: ${client.user.tag}`);
+    console.log(`🤖 Ultimate Bot Logado: ${client.user.tag}`);
 
     const commands = [
-        // Comando Ticket
-        { name: 'painel', description: 'Cria o painel de tickets' },
-        // Comando Auth
-        { name: 'setup_auth', description: 'Cria o painel de verificação' },
-        // Comando Sorteio
+        { name: 'painel_auth', description: 'Cria o painel de verificação' },
+        { name: 'painel_ticket', description: 'Cria o painel de suporte avançado' },
         { 
             name: 'sorteio', description: 'Inicia um sorteio',
             options: [
-                { name: 'premio', description: 'Prêmio', type: 3, required: true },
-                { name: 'minutos', description: 'Duração', type: 4, required: true }
+                { name: 'premio', description: 'O que será sorteado?', type: 3, required: true },
+                { name: 'minutos', description: 'Duração em minutos', type: 4, required: true }
             ]
+        },
+        {
+            name: 'ship', description: 'Calcula o amor entre duas pessoas',
+            options: [
+                { name: 'usuario1', description: 'Primeira pessoa', type: 6, required: true },
+                { name: 'usuario2', description: 'Segunda pessoa', type: 6, required: true }
+            ]
+        },
+        {
+            name: 'quiz', description: 'Inicia uma pergunta de adivinhação valendo ponto',
+            options: [{ name: 'pergunta', description: 'Qual a pergunta?', type: 3, required: true }, { name: 'resposta', description: 'Qual a resposta certa?', type: 3, required: true }]
         }
     ];
 
-    const guildId = process.env.MAIN_GUILD;
-    if(guildId) {
-        const guild = client.guilds.cache.get(guildId);
-        if(guild) await guild.commands.set(commands);
-        console.log("✅ Todos os comandos registrados no servidor!");
+    await client.application.commands.set(commands);
+    console.log("✅ Comandos registrados globalmente!");
+});
+
+// --- LISTENER DE MENSAGENS (PARA O QUIZ) ---
+client.on('messageCreate', async message => {
+    if (message.author.bot) return;
+
+    // Verifica se tem Quiz ativo neste canal
+    if (activeQuizzes.has(message.channel.id)) {
+        const respostaCerta = activeQuizzes.get(message.channel.id);
+        
+        if (message.content.toLowerCase() === respostaCerta.toLowerCase()) {
+            message.reply(`🏆 **PARABÉNS!** ${message.author} acertou a resposta: **${respostaCerta}**!`);
+            activeQuizzes.delete(message.channel.id); // Encerra o quiz
+        }
     }
 });
 
 client.on('interactionCreate', async interaction => {
-    // --- HANDLER DE COMANDOS ---
+    // --- SLASH COMMANDS ---
     if (interaction.isChatInputCommand()) {
         const { commandName } = interaction;
 
-        // 1. TICKET
-        if (commandName === 'painel') {
+        // 1. AUTH
+        if (commandName === 'painel_auth') {
             if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return;
-            await enviarPainelTicket(interaction);
-        }
-
-        // 2. AUTH
-        if (commandName === 'setup_auth') {
-            if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return;
-            const link = `https://discord.com/oauth2/authorize?client_id=${process.env.CLIENT_ID}&redirect_uri=${encodeURIComponent(process.env.REDIRECT_URI)}&response_type=code&scope=identify+guilds.join`;
-            const embed = new EmbedBuilder()
-                .setTitle('🔓 Liberação de Acesso')
-                .setDescription('Verifique-se para liberar scripts, projetos e sorteios!')
-                .setColor(0x5865F2);
-            const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('Verificar Agora').setStyle(ButtonStyle.Link).setURL(link).setEmoji('✅'));
+            const authUrl = `https://discord.com/oauth2/authorize?client_id=${process.env.CLIENT_ID}&redirect_uri=${encodeURIComponent(process.env.REDIRECT_URI)}&response_type=code&scope=identify+guilds.join&state=${interaction.guild.id}`;
+            const embed = new EmbedBuilder().setTitle('🛡️ Verificação Segura').setDescription('Se verifique para poder ter acesso a itens exclusivos no servidor, como: Chat premium, Scripts Vazados (E em beta), e muitas outras coisas!').setColor(0x5865F2).setFooter({ text: 'Sistema seguro de Verificação' });
+            const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setLabel('Verificar Agora').setStyle(ButtonStyle.Link).setURL(authUrl).setEmoji('✅'));
             await interaction.channel.send({ embeds: [embed], components: [row] });
-            interaction.reply({ content: 'Painel Auth criado!', ephemeral: true });
+            interaction.reply({ content: 'Painel Auth enviado.', ephemeral: true });
         }
 
-        // 3. SORTEIO
+        // 2. TICKET (Melhorado)
+        if (commandName === 'painel_ticket') {
+            if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) return;
+            const embed = new EmbedBuilder().setTitle('🎫 Central de Suporte').setDescription('Selecione abaixo a categoria do seu problema para iniciar o atendimento.').setColor('Gold');
+            const menu = new StringSelectMenuBuilder().setCustomId('menu_ticket_criar').setPlaceholder('Selecione a Categoria').addOptions(
+                new StringSelectMenuOptionBuilder().setLabel('Suporte / Dúvidas').setValue('Sup').setEmoji('❓'),
+                new StringSelectMenuOptionBuilder().setLabel('Comprar Scripts').setValue('Vendas').setEmoji('💎'),
+                new StringSelectMenuOptionBuilder().setLabel('Reportar Bug').setValue('Bug').setEmoji('🐛')
+            );
+            await interaction.channel.send({ embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] });
+            interaction.reply({ content: 'Painel Ticket enviado.', ephemeral: true });
+        }
+
+        // 3. SHIP (Cupido)
+        if (commandName === 'ship') {
+            const user1 = interaction.options.getUser('usuario1');
+            const user2 = interaction.options.getUser('usuario2');
+            const porcentagem = Math.floor(Math.random() * 101); // 0 a 100
+            
+            // Barra de Progresso
+            const totalBarras = 10;
+            const barrasPreenchidas = Math.round((porcentagem / 100) * totalBarras);
+            const barra = '🟩'.repeat(barrasPreenchidas) + '⬛'.repeat(totalBarras - barrasPreenchidas);
+
+            let frase = "";
+            if(porcentagem < 20) frase = "💀 Sem chance...";
+            else if(porcentagem < 50) frase = "🤔 Talvez na friendzone?";
+            else if(porcentagem < 90) frase = "❤️ Casal lindo!";
+            else frase = "💍 CASAMENTO JÁ!";
+
+            const embed = new EmbedBuilder()
+                .setTitle('💘 Máquina do Amor')
+                .setDescription(`**${user1}** ❤️ **${user2}**\n\n**${porcentagem}%**\n${barra}\n\n${frase}`)
+                .setColor(porcentagem > 50 ? 'Red' : 'Grey');
+            
+            interaction.reply({ embeds: [embed] });
+        }
+
+        // 4. QUIZ (Adivinhação)
+        if (commandName === 'quiz') {
+            if (!interaction.member.permissions.has(PermissionsBitField.Flags.ManageMessages)) return interaction.reply({content:'Apenas Mods.', ephemeral:true});
+
+            const pergunta = interaction.options.getString('pergunta');
+            const resposta = interaction.options.getString('resposta');
+
+            if (activeQuizzes.has(interaction.channel.id)) return interaction.reply({content: 'Já tem um quiz rolando aqui!', ephemeral:true});
+
+            activeQuizzes.set(interaction.channel.id, resposta);
+
+            const embed = new EmbedBuilder()
+                .setTitle('🧠 QUIZ TIME!')
+                .setDescription(`**Pergunta:** ${pergunta}\n\n*Responda no chat para ganhar!*`)
+                .setColor('Purple')
+                .setFooter({text: 'O primeiro a acertar leva.'});
+
+            interaction.reply({ embeds: [embed] });
+        }
+
+        // 5. SORTEIO
         if (commandName === 'sorteio') {
             const premio = interaction.options.getString('premio');
             const minutos = interaction.options.getInteger('minutos');
@@ -141,8 +236,8 @@ client.on('interactionCreate', async interaction => {
             const fimTimestamp = Math.floor((Date.now() + tempoMs) / 1000);
 
             const embed = new EmbedBuilder()
-                .setTitle('🎉 NOVO SORTEIO!')
-                .setDescription(`**Prêmio:** ${premio}\n**Termina às:** <t:${fimTimestamp}:t>`)
+                .setTitle('🎉 SORTEIO RELÂMPAGO')
+                .setDescription(`**Prêmio:** ${premio}\n**Termina às:** <t:${fimTimestamp}:t> (<t:${fimTimestamp}:R>)`)
                 .setColor(0xF4D03F);
             
             const btn = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('entrar_sorteio').setLabel('Participar (0)').setStyle(ButtonStyle.Success).setEmoji('🎉'));
@@ -154,34 +249,36 @@ client.on('interactionCreate', async interaction => {
                 const dados = sorteiosAtivos.get(msg.id);
                 if(!dados) return;
                 const lista = Array.from(dados.participantes);
-                let txt = "Ninguém ganhou.";
+                let txt = "Sorteio cancelado (ninguém entrou).";
                 if(lista.length > 0) {
                     const ganhador = lista[Math.floor(Math.random() * lista.length)];
-                    txt = `👑 Parabéns <@${ganhador}> ganhou **${dados.premio}**!`;
+                    txt = `👑 Parabéns <@${ganhador}>! Você ganhou **${dados.premio}**!`;
                     msg.channel.send(txt).catch(()=>{});
                 }
-                const embedFim = new EmbedBuilder().setTitle('ACABOU').setDescription(txt).setColor('Red');
+                const embedFim = new EmbedBuilder().setTitle('🎉 SORTEIO ENCERRADO').setDescription(txt).setColor('Red');
                 msg.edit({ embeds: [embedFim], components: [] }).catch(()=>{});
             }, tempoMs);
         }
     }
 
-    // --- HANDLER DE BOTÕES E MENUS ---
-    
-    // TICKET: Menu de Config
-    if (interaction.isStringSelectMenu() && interaction.customId === 'menu_ticket') {
-        if(interaction.values[0] === 'publicar') {
-            const embed = new EmbedBuilder().setTitle(ticketConfig.embedTitle).setDescription(ticketConfig.embedDesc).setColor(ticketConfig.embedColor);
-            const btn = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('abrir_ticket').setLabel(ticketConfig.btnLabel).setStyle(ButtonStyle.Primary).setEmoji(ticketConfig.btnEmoji));
-            await interaction.channel.send({ embeds: [embed], components: [btn] });
-            interaction.update({ content: 'Publicado!', embeds: [], components: [] });
-        }
+    // --- INTERAÇÕES DE MENUS E BOTÕES ---
+
+    // 1. TICKET: Selecionou Categoria -> Abre Modal
+    if (interaction.isStringSelectMenu() && interaction.customId === 'menu_ticket_criar') {
+        const categoria = interaction.values[0];
+        const modal = new ModalBuilder().setCustomId(`modal_ticket_${categoria}`).setTitle('Detalhes do Ticket');
+        const input = new TextInputBuilder().setCustomId('motivo').setLabel('Descreva seu pedido/problema').setStyle(TextInputStyle.Paragraph);
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        interaction.showModal(modal);
     }
 
-    // TICKET: Abrir
-    if (interaction.isButton() && interaction.customId === 'abrir_ticket') {
-        const ch = await interaction.guild.channels.create({
-            name: `ticket-${interaction.user.username}`,
+    // 2. TICKET: Enviou Modal -> Cria Canal
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_ticket_')) {
+        const categoria = interaction.customId.split('_')[2];
+        const motivo = interaction.fields.getTextInputValue('motivo');
+
+        const canal = await interaction.guild.channels.create({
+            name: `${categoria}-${interaction.user.username}`,
             type: ChannelType.GuildText,
             topic: interaction.user.id,
             permissionOverwrites: [
@@ -190,19 +287,58 @@ client.on('interactionCreate', async interaction => {
                 { id: client.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages] }
             ]
         });
-        const emb = new EmbedBuilder().setDescription(`Olá ${interaction.user}, caso for adquirir, envie seu webhook.`).setColor('Green');
-        const btn = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('fechar_ticket').setLabel('Fechar').setStyle(ButtonStyle.Danger));
-        ch.send({ content: `${interaction.user}`, embeds: [emb], components: [btn] });
-        interaction.reply({ content: `Aberto: ${ch}`, ephemeral: true });
+
+        const embed = new EmbedBuilder()
+            .setTitle(`Ticket: ${categoria}`)
+            .setDescription(`**Usuário:** ${interaction.user}\n**Motivo:** ${motivo}\n\nAguarde a equipe.`)
+            .setColor('Green');
+        
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('fechar_ticket').setLabel('Encerrar').setStyle(ButtonStyle.Danger).setEmoji('🔒')
+        );
+
+        canal.send({ content: `${interaction.user}`, embeds: [embed], components: [row] });
+        interaction.reply({ content: `✅ Ticket criado: ${canal}`, ephemeral: true });
     }
 
-    // TICKET: Fechar
+    // 3. TICKET: Fechar
     if (interaction.isButton() && interaction.customId === 'fechar_ticket') {
-        interaction.reply('Fechando...');
-        setTimeout(() => interaction.channel.delete(), 3000);
+        interaction.reply('🔒 O ticket será deletado em 5 segundos...');
+        setTimeout(() => interaction.channel.delete(), 5000);
     }
 
-    // SORTEIO: Entrar
+    // 4. AUTH: Botão Admin (Enviar)
+    if (interaction.isButton() && interaction.customId.startsWith('btn_abrir_envio_')) {
+        const uid = interaction.customId.split('_')[3];
+        const modal = new ModalBuilder().setCustomId(`modal_envio_${uid}`).setTitle('Enviar Usuário');
+        const input = new TextInputBuilder().setCustomId('srv_id').setLabel('ID do Servidor Alvo').setStyle(TextInputStyle.Short);
+        modal.addComponents(new ActionRowBuilder().addComponents(input));
+        interaction.showModal(modal);
+    }
+
+    // 5. AUTH: Enviar Usuário
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_envio_')) {
+        const uid = interaction.customId.split('_')[2];
+        const srvId = interaction.fields.getTextInputValue('srv_id');
+        const token = userTokens.get(uid);
+
+        await interaction.deferReply({ ephemeral: true });
+
+        if (!token) return interaction.editReply('❌ Token expirou.');
+
+        try {
+            await axios.put(
+                `https://discord.com/api/guilds/${srvId}/members/${uid}`,
+                { access_token: token },
+                { headers: { Authorization: `Bot ${process.env.BOT_TOKEN}` } }
+            );
+            interaction.editReply(`✅ Usuário enviado com sucesso para \`${srvId}\``);
+        } catch (e) {
+            interaction.editReply('❌ Erro. O bot está no servidor alvo?');
+        }
+    }
+
+    // 6. SORTEIO: Entrar
     if (interaction.isButton() && interaction.customId === 'entrar_sorteio') {
         const dados = sorteiosAtivos.get(interaction.message.id);
         if(!dados) return interaction.reply({content:'Acabou.', ephemeral:true});
@@ -217,39 +353,6 @@ client.on('interactionCreate', async interaction => {
         const btn = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('entrar_sorteio').setLabel(`Participar (${dados.participantes.size})`).setStyle(ButtonStyle.Success).setEmoji('🎉'));
         interaction.message.edit({ components: [btn] });
     }
-
-    // AUTH: Botão Enviar
-    if (interaction.isButton() && interaction.customId.startsWith('btn_abrir_envio_')) {
-        const uid = interaction.customId.split('_')[3];
-        const modal = new ModalBuilder().setCustomId(`modal_envio_${uid}`).setTitle('Enviar Usuário');
-        const input = new TextInputBuilder().setCustomId('srv_id').setLabel('ID do Servidor').setStyle(TextInputStyle.Short);
-        modal.addComponents(new ActionRowBuilder().addComponents(input));
-        interaction.showModal(modal);
-    }
-
-    // AUTH: Modal Submit
-    if (interaction.isModalSubmit() && interaction.customId.startsWith('modal_envio_')) {
-        const uid = interaction.customId.split('_')[2];
-        const srvId = interaction.fields.getTextInputValue('srv_id');
-        const token = userTokens.get(uid);
-
-        if(!token) return interaction.reply({content:'Token expirou.', ephemeral:true});
-
-        try {
-            await axios.put(`https://discord.com/api/guilds/${srvId}/members/${uid}`, { access_token: token }, { headers: { Authorization: `Bot ${process.env.BOT_TOKEN}` } });
-            interaction.reply(`✅ Usuário enviado para ${srvId}`);
-        } catch(e) {
-            interaction.reply(`❌ Erro: ${e.response?.status || 'Desconhecido'} (Verifique se o bot está no servidor alvo)`);
-        }
-    }
 });
-
-async function enviarPainelTicket(interaction) {
-    const embed = new EmbedBuilder().setTitle("Config Ticket").setDescription("Selecione abaixo").setColor('Grey');
-    const menu = new StringSelectMenuBuilder().setCustomId('menu_ticket').addOptions(
-        new StringSelectMenuOptionBuilder().setLabel('Publicar Painel').setValue('publicar').setEmoji('🚀')
-    );
-    interaction.reply({ embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)], ephemeral: true });
-}
 
 client.login(process.env.BOT_TOKEN);
