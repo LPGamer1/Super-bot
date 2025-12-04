@@ -1,78 +1,146 @@
 import os
 import discord
 from discord.ext import commands
-from discord import app_commands
-import mercadopago
 import pymongo
 import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
+from aiohttp import web
+import random
 
-# Carrega variáveis de ambiente do arquivo .env (se existir)
 load_dotenv()
 
-# --- CONFIGURAÇÃO (Variáveis de Ambiente) ---
+# --- CONFIGURAÇÃO ---
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
-MP_ACCESS_TOKEN = os.getenv("MP_ACCESS_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0)) # Seu ID no Discord
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+CHAVE_PIX = os.getenv("CHAVE_PIX") # Sua chave (CPF, Email ou Aleatória)
+NOME_TITULAR = os.getenv("NOME_TITULAR") # Nome que aparece no comprovante
 
-# --- INICIALIZAÇÃO DO BOT E BANCO DE DADOS ---
+# --- INICIALIZAÇÃO ---
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Conexão MongoDB
-try:
-    mongo_client = pymongo.MongoClient(MONGO_URI)
-    db = mongo_client["loja_bot_avancado"]
-    collection_estoque = db["estoque"]
-    collection_config = db["config"]
-    print("✅ Conectado ao MongoDB!")
-except Exception as e:
-    print(f"❌ Erro ao conectar ao MongoDB: {e}")
-    exit()
+# Banco de Dados
+mongo_client = pymongo.MongoClient(MONGO_URI)
+db = mongo_client["loja_nubank"]
+collection_estoque = db["estoque"]
+collection_pendentes = db["pagamentos_pendentes"] # Guarda quem deve pagar quanto
 
-# Conexão Mercado Pago
-try:
-    sdk = mercadopago.SDK(MP_ACCESS_TOKEN)
-    print("✅ SDK do Mercado Pago inicializado!")
-except Exception as e:
-    print(f"❌ Erro ao inicializar SDK do Mercado Pago: {e}")
-    exit()
-
-# --- FUNÇÕES AUXILIARES DE PAGAMENTO ---
-async def gerar_pagamento(valor, produto_nome, user_id):
+# --- WEBSERVER (Para ouvir o Celular) ---
+async def handle_webhook(request):
     try:
-        payment_data = {
-            "transaction_amount": float(valor),
-            "description": f"Compra: {produto_nome}",
-            "payment_method_id": "pix",
-            "payer": {"email": f"user_{user_id}@discord.com", "first_name": f"User_{user_id}"}
+        data = await request.json()
+        # O MacroDroid vai enviar um JSON: {"mensagem": "Você recebeu uma transferência de R$ 10,03 de..."}
+        mensagem = data.get("message", "")
+        print(f"🔔 Notificação recebida: {mensagem}")
+
+        # Lógica simples para extrair valor (Adapte conforme a notificação do seu banco)
+        # Exemplo notificação Nubank: "Transferência recebida! Você recebeu R$ 10,03 de João..."
+        import re
+        # Procura por "R$ 10,03" ou "10,03"
+        match = re.search(r'R\$\s?(\d+[,.]\d{2})', mensagem)
+        
+        if match:
+            valor_str = match.group(1).replace('.', '').replace(',', '.') # Transforma 10,03 em 10.03 float
+            valor_recebido = float(valor_str)
+            
+            # Procura quem tinha que pagar esse valor EXATO
+            pagamento = collection_pendentes.find_one({"valor_esperado": valor_recebido, "status": "pendente"})
+            
+            if pagamento:
+                await entregar_produto(pagamento)
+                return web.Response(text="Pagamento Processado")
+            else:
+                print(f"⚠️ Valor {valor_recebido} recebido, mas ninguém estava esperando esse valor exato.")
+        
+        return web.Response(text="OK")
+    except Exception as e:
+        print(f"Erro no webhook: {e}")
+        return web.Response(status=500)
+
+async def entregar_produto(pagamento):
+    # Marca como pago
+    collection_pendentes.update_one({"_id": pagamento["_id"]}, {"$set": {"status": "pago"}})
+    
+    # Baixa estoque
+    from bson.objectid import ObjectId
+    produto = collection_estoque.find_one_and_update(
+        {"_id": ObjectId(pagamento["produto_id"])},
+        {"$inc": {"estoque": -1}},
+        return_document=pymongo.ReturnDocument.AFTER
+    )
+    
+    # Tenta avisar no canal do ticket
+    channel = bot.get_channel(pagamento["channel_id"])
+    if channel:
+        await channel.send(f"✅ **Pagamento de R$ {pagamento['valor_esperado']:.2f} Identificado!**\n\nSeu produto:\n```{produto['conteudo']}```", view=FecharTicketView())
+    else:
+        # Se o canal sumiu, tenta DM
+        user = await bot.fetch_user(pagamento["user_id"])
+        await user.send(f"Seu pagamento de R$ {pagamento['valor_esperado']} foi confirmado!\nProduto: {produto['conteudo']}")
+
+# --- DISCORD VIEWS ---
+class FecharTicketView(discord.ui.View):
+    def __init__(self): super().__init__(timeout=None)
+    @discord.ui.button(label="Fechar Ticket 🔒", style=discord.ButtonStyle.danger)
+    async def fechar(self, interaction: discord.Interaction, button):
+        await interaction.channel.delete()
+
+class ConfirmacaoView(discord.ui.View):
+    def __init__(self, produto):
+        super().__init__(timeout=None)
+        self.produto = produto
+
+    @discord.ui.button(label="Comprar (Pix Nubank)", style=discord.ButtonStyle.blurple, emoji="🟣")
+    async def comprar(self, interaction: discord.Interaction, button):
+        await interaction.response.defer(ephemeral=True)
+        
+        # Gera centavos aleatórios (entre 0.01 e 0.99) para identificar
+        centavos = random.randint(1, 99) / 100
+        valor_final = self.produto['valor'] + centavos
+        valor_final = round(valor_final, 2)
+        
+        # Verifica se já tem alguém pagando esse valor agora (para não conflitar)
+        while collection_pendentes.find_one({"valor_esperado": valor_final, "status": "pendente"}):
+            centavos = random.randint(1, 99) / 100
+            valor_final = self.produto['valor'] + centavos
+            valor_final = round(valor_final, 2)
+
+        # Cria Ticket
+        guild = interaction.guild
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            interaction.user: discord.PermissionOverwrite(read_messages=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True)
         }
-        result = sdk.payment().create(payment_data)
-        if result["status"] == 201:
-            return result["response"]
-        else:
-            print(f"Erro Mercado Pago: {result}")
-            return None
-    except Exception as e:
-        print(f"Erro ao gerar pagamento: {e}")
-        return None
-
-async def verificar_pagamento(payment_id):
-    try:
-        payment_info = sdk.payment().get(payment_id)
-        if payment_info["status"] == 200:
-            return payment_info["response"]["status"] == "approved"
-        else:
-            print(f"Erro ao verificar pagamento: {payment_info}")
-            return False
-    except Exception as e:
-        print(f"Erro na verificação do pagamento: {e}")
-        return False
-
-# --- CLASSES DE INTERFACE (VIEWS E SELECTS) ---
+        ticket = await guild.create_text_channel(name=f"compra-{interaction.user.name}", overwrites=overwrites)
+        
+        # Salva a pendência
+        collection_pendentes.insert_one({
+            "user_id": interaction.user.id,
+            "produto_id": self.produto["_id"],
+            "valor_esperado": valor_final,
+            "channel_id": ticket.id,
+            "status": "pendente",
+            "criado_em": datetime.now()
+        })
+        
+        msg = f"""
+        # 🟣 Pagamento Nubank (Pessoa Física)
+        
+        Para confirmar automaticamente, você deve transferir o valor **EXATO** (com os centavos).
+        
+        💰 Valor Obrigatório: **R$ {valor_final:.2f}**
+        🔑 Chave Pix: `{CHAVE_PIX}`
+        👤 Titular: **{NOME_TITULAR}**
+        
+        ⚠️ **ATENÇÃO:** Se você enviar R$ {self.produto['valor']:.2f} ou valor diferente, o bot **NÃO** vai entregar. Envie **R$ {valor_final:.2f}**.
+        """
+        await ticket.send(interaction.user.mention)
+        await ticket.send(msg)
+        await interaction.followup.send(f"Ticket criado: {ticket.mention}", ephemeral=True)
 
 class LojaView(discord.ui.View):
     def __init__(self):
@@ -82,218 +150,44 @@ class LojaView(discord.ui.View):
 class LojaSelect(discord.ui.Select):
     def __init__(self):
         options = []
-        # Busca produtos com estoque > 0
         produtos = collection_estoque.find({"estoque": {"$gt": 0}})
-        
-        if collection_estoque.count_documents({"estoque": {"$gt": 0}}) == 0:
-            options.append(discord.SelectOption(label="Nenhum produto disponível", value="nenhum", emoji="🚫"))
-        else:
-            for p in produtos:
-                emoji = p.get('emoji', '📦') # Emoji padrão se não tiver
-                label = f"{p['nome']}"
-                description = f"R$ {p['valor']:.2f} | Estoque: {p['estoque']}"
-                options.append(discord.SelectOption(label=label, description=description, value=p['_id'], emoji=emoji))
-        
-        super().__init__(placeholder="Selecione um produto", min_values=1, max_values=1, options=options)
+        for p in produtos:
+            options.append(discord.SelectOption(label=p['nome'], description=f"Base: R$ {p['valor']:.2f}", value=str(p['_id'])))
+        if not options: options.append(discord.SelectOption(label="Vazio", value="n"))
+        super().__init__(placeholder="Escolha o produto", options=options)
 
-    async def callback(self, interaction: discord.Interaction):
-        if self.values[0] == "nenhum":
-            await interaction.response.send_message("Não há produtos para comprar no momento.", ephemeral=True)
-            return
+    async def callback(self, interaction):
+        if self.values[0] == "n": return await interaction.response.send_message("Vazio", ephemeral=True)
+        from bson.objectid import ObjectId
+        produto = collection_estoque.find_one({"_id": ObjectId(self.values[0])})
+        await interaction.response.send_message(view=ConfirmacaoView(produto), ephemeral=True)
 
-        # Busca o produto selecionado
-        produto_id = self.values[0]
-        produto = collection_estoque.find_one({"_id": produto_id})
-        
-        if not produto:
-            await interaction.response.send_message("Produto não encontrado.", ephemeral=True)
-            return
+# --- COMANDOS E START ---
+@bot.tree.command(name="painel")
+async def painel(interaction: discord.Interaction):
+    if interaction.user.id == ADMIN_ID: await interaction.channel.send("Loja Nubank", view=LojaView())
 
-        # Cria o embed de confirmação
-        embed = discord.Embed(title=f"Confirmar Compra: {produto['nome']}", color=discord.Color.green())
-        embed.add_field(name="Valor", value=f"R$ {produto['valor']:.2f}", inline=True)
-        embed.add_field(name="Descrição", value=produto.get('descricao', 'Sem descrição'), inline=False)
-        if produto.get('imagem_url'):
-            embed.set_thumbnail(url=produto['imagem_url'])
-        
-        # Adiciona o botão de confirmação
-        view = ConfirmacaoView(produto)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+@bot.tree.command(name="add_prod")
+async def add(interaction: discord.Interaction, nome: str, valor: float, estoque: int, conteudo: str):
+    if interaction.user.id == ADMIN_ID: 
+        collection_estoque.insert_one({"nome": nome, "valor": valor, "estoque": estoque, "conteudo": conteudo})
+        await interaction.response.send_message("Add!")
 
-class ConfirmacaoView(discord.ui.View):
-    def __init__(self, produto):
-        super().__init__(timeout=300) # 5 minutos para confirmar
-        self.produto = produto
+async def run_webserver():
+    app = web.Application()
+    app.router.add_post('/webhook', handle_webhook)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # O Render fornece a porta na variável PORT, padrão 8080 se não tiver
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌍 Webserver ouvindo na porta {port}")
 
-    @discord.ui.button(label="Confirmar Compra", style=discord.ButtonStyle.success, emoji="✅")
-    async def confirmar_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.defer(ephemeral=True)
-        self.stop() # Para o timeout da view
+async def main():
+    async with bot:
+        await run_webserver()
+        await bot.start(DISCORD_TOKEN)
 
-        # Verifica estoque novamente
-        produto_atualizado = collection_estoque.find_one({"_id": self.produto["_id"], "estoque": {"$gt": 0}})
-        if not produto_atualizado:
-            await interaction.followup.send("❌ Produto esgotado.", ephemeral=True)
-            return
-
-        pagamento = await gerar_pagamento(self.produto['valor'], self.produto['nome'], interaction.user.id)
-        
-        if not pagamento:
-            await interaction.followup.send("❌ Erro ao gerar pagamento. Tente novamente.", ephemeral=True)
-            return
-
-        pix_copia_cola = pagamento['point_of_interaction']['transaction_data']['qr_code']
-        qr_code_base64 = pagamento['point_of_interaction']['transaction_data']['qr_code_base64']
-        payment_id = pagamento['id']
-        
-        embed_pix = discord.Embed(title=f"Pagamento Pix: {self.produto['nome']}", description=f"Valor: **R${self.produto['valor']:.2f}**\n\nCopie o código abaixo e pague no seu banco via Pix Copia e Cola.", color=discord.Color.blue())
-        await interaction.followup.send(embed=embed_pix, content=f"```{pix_copia_cola}```", ephemeral=True)
-        
-        # Loop de verificação
-        start_time = datetime.now()
-        pago = False
-        while (datetime.now() - start_time).seconds < 600: # 10 minutos
-            if await verificar_pagamento(payment_id):
-                pago = True
-                break
-            await asyncio.sleep(5)
-        
-        if pago:
-            # Tenta decrementar o estoque e pegar o conteúdo
-            item_vendido = collection_estoque.find_one_and_update(
-                {"_id": self.produto["_id"], "estoque": {"$gt": 0}},
-                {"$inc": {"estoque": -1}, "$push": {"vendas": {"comprador_id": interaction.user.id, "data": datetime.now(), "valor": self.produto['valor']}}},
-                return_document=pymongo.ReturnDocument.AFTER
-            )
-            
-            if item_vendido:
-                try:
-                    dm = await interaction.user.create_dm()
-                    embed_entrega = discord.Embed(title="✅ Pagamento Aprovado!", description=f"Obrigado pela compra do **{self.produto['nome']}**!", color=discord.Color.gold())
-                    embed_entrega.add_field(name="Seu Produto", value=f"```{item_vendido['conteudo']}```", inline=False)
-                    await dm.send(embed=embed_entrega)
-                    await interaction.followup.send("✅ Pagamento confirmado! Produto enviado na sua DM.", ephemeral=True)
-                except:
-                    await interaction.followup.send(f"✅ Pagamento confirmado! Mas sua DM está fechada. Aqui está: ||{item_vendido['conteudo']}||", ephemeral=True)
-            else:
-                await interaction.followup.send("⚠️ Pagamento recebido, mas o produto acabou de sair de estoque. Contate o admin.", ephemeral=True)
-        else:
-            await interaction.followup.send("⏰ Tempo de pagamento expirou.", ephemeral=True)
-
-
-# --- COMANDOS DO BOT ---
-
-@bot.event
-async def on_ready():
-    print(f'Bot logado como {bot.user}')
-    try:
-        synced = await bot.tree.sync()
-        print(f"Comandos sincronizados: {len(synced)}")
-    except Exception as e:
-        print(f"Erro ao sincronizar: {e}")
-
-# 1. Adicionar Produto (Admin)
-@bot.tree.command(name="adicionar_produto", description="Adiciona um novo produto ao estoque.")
-@app_commands.describe(
-    nome="Nome do produto (ex: Nitro)",
-    valor="Preço do produto (ex: 15.50)",
-    estoque="Quantidade inicial em estoque",
-    conteudo="O que será entregue (código/texto)",
-    descricao="Breve descrição do produto",
-    emoji="Emoji para o menu (ex: 💎)",
-    imagem_url="URL de uma imagem para o produto"
-)
-async def adicionar_produto(interaction: discord.Interaction, nome: str, valor: float, estoque: int, conteudo: str, descricao: str = "", emoji: str = "📦", imagem_url: str = ""):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("❌ Apenas o dono pode fazer isso.", ephemeral=True)
-        return
-
-    item = {
-        "nome": nome,
-        "valor": valor,
-        "estoque": estoque,
-        "conteudo": conteudo,
-        "descricao": descricao,
-        "emoji": emoji,
-        "imagem_url": imagem_url,
-        "vendas": []
-    }
-    collection_estoque.insert_one(item)
-    await interaction.response.send_message(f"✅ Produto **{nome}** adicionado com {estoque} unidades por R${valor:.2f}!", ephemeral=True)
-
-# 2. Configurar Loja (Admin)
-@bot.tree.command(name="setup_loja", description="Configura a aparência do painel da loja.")
-@app_commands.describe(
-    titulo="Título do Embed da loja",
-    descricao="Descrição do Embed da loja",
-    imagem_url="URL da imagem principal do embed",
-    thumbnail_url="URL do ícone pequeno do embed",
-    footer_text="Texto do rodapé do embed"
-)
-async def setup_loja(interaction: discord.Interaction, titulo: str = "Minha Loja", descricao: str = "Bem-vindo à nossa loja!", imagem_url: str = "", thumbnail_url: str = "", footer_text: str = ""):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("❌ Apenas o dono pode fazer isso.", ephemeral=True)
-        return
-    
-    config = {
-        "titulo": titulo,
-        "descricao": descricao,
-        "imagem_url": imagem_url,
-        "thumbnail_url": thumbnail_url,
-        "footer_text": footer_text
-    }
-    collection_config.update_one({"_id": "config_loja"}, {"$set": config}, upsert=True)
-    await interaction.response.send_message("✅ Configurações da loja atualizadas!", ephemeral=True)
-
-# 3. Exibir Painel de Vendas (Admin)
-@bot.tree.command(name="painel_vendas", description="Exibe o painel de vendas no canal atual.")
-async def painel_vendas(interaction: discord.Interaction):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("❌ Apenas o dono pode fazer isso.", ephemeral=True)
-        return
-    
-    config = collection_config.find_one({"_id": "config_loja"})
-    if not config:
-        config = {"titulo": "Minha Loja", "descricao": "Bem-vindo!", "imagem_url": "", "thumbnail_url": "", "footer_text": ""}
-
-    embed = discord.Embed(title=config.get("titulo"), description=config.get("descricao"), color=discord.Color.blue())
-    if config.get("imagem_url"):
-        embed.set_image(url=config.get("imagem_url"))
-    if config.get("thumbnail_url"):
-        embed.set_thumbnail(url=config.get("thumbnail_url"))
-    if config.get("footer_text"):
-        embed.set_footer(text=config.get("footer_text"))
-    
-    await interaction.channel.send(embed=embed, view=LojaView())
-    await interaction.response.send_message("✅ Painel de vendas enviado!", ephemeral=True)
-
-# 4. Reabastecer Estoque (Admin)
-@bot.tree.command(name="reabastecer", description="Adiciona mais estoque a um produto.")
-@app_commands.describe(nome_produto="Nome exato do produto", quantidade="Quantidade a adicionar")
-async def reabastecer(interaction: discord.Interaction, nome_produto: str, quantidade: int):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("❌ Apenas o dono pode fazer isso.", ephemeral=True)
-        return
-    
-    result = collection_estoque.update_one({"nome": nome_produto}, {"$inc": {"estoque": quantidade}})
-    if result.modified_count > 0:
-        await interaction.response.send_message(f"✅ Estoque de **{nome_produto}** aumentado em {quantidade} unidades.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"❌ Produto **{nome_produto}** não encontrado.", ephemeral=True)
-
-# 5. Remover Produto (Admin)
-@bot.tree.command(name="remover_produto", description="Remove um produto do estoque.")
-@app_commands.describe(nome_produto="Nome exato do produto a remover")
-async def remover_produto(interaction: discord.Interaction, nome_produto: str):
-    if interaction.user.id != ADMIN_ID:
-        await interaction.response.send_message("❌ Apenas o dono pode fazer isso.", ephemeral=True)
-        return
-    
-    result = collection_estoque.delete_one({"nome": nome_produto})
-    if result.deleted_count > 0:
-        await interaction.response.send_message(f"✅ Produto **{nome_produto}** removido.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"❌ Produto **{nome_produto}** não encontrado.", ephemeral=True)
-
-
-bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    asyncio.run(main())
