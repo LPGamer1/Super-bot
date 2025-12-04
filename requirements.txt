@@ -1,0 +1,7 @@
+discord.py
+pymongo
+mercadopago
+python-dotenv
+qrcode
+pillow
+dnspython
