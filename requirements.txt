@@ -1,7 +1,5 @@
 discord.py
 pymongo
-mercadopago
+aiohttp
 python-dotenv
-qrcode
-pillow
 dnspython
